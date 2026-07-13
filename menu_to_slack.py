@@ -94,12 +94,21 @@ def build_message(posts, date_str, keyword):
 
 
 def collect_images(posts):
-    """모든 포스트의 이미지를 다운로드해 (filename, bytes) 리스트로 반환."""
+    """포스트의 가로(음식) 사진만 다운로드해 (filename, bytes) 리스트로 반환.
+
+    세로 이미지(width <= height)는 영양표이므로 제외한다. width/height
+    메타데이터가 없으면 음식 사진 누락을 막기 위해 포함한다.
+    """
     images = []
+    skipped = 0
     for p in posts:
         for i, m in enumerate(p.get("media", [])):
             url = m.get("xlarge_url") or m.get("url")
             if not url or m.get("type") != "image":
+                continue
+            w, h = m.get("width") or 0, m.get("height") or 0
+            if w and h and w <= h:  # 세로 = 영양표 → 제외
+                skipped += 1
                 continue
             try:
                 resp = requests.get(
@@ -109,7 +118,7 @@ def collect_images(posts):
                 images.append((f"menu_{p['id']}_{i + 1}.jpg", resp.content))
             except Exception as e:
                 log(f"이미지 다운로드 실패 (건너뜀): {url} — {e}")
-    return images
+    return images, skipped
 
 
 def send_to_slack(message, images):
@@ -199,8 +208,8 @@ def main():
     message, ordered = build_message(matched, date_str, keyword)
     log(f"포스트 {len(ordered)}개 매칭:\n{message}")
 
-    images = collect_images(ordered)
-    log(f"이미지 {len(images)}장 다운로드 완료")
+    images, skipped = collect_images(ordered)
+    log(f"가로 음식 사진 {len(images)}장 첨부 (영양표 {skipped}장 제외)")
 
     if args.dry_run:
         log("dry-run 모드 — 슬랙 전송 생략")
