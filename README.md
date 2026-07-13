@@ -10,15 +10,15 @@
 
 ## 최초 설정
 
-### 1. 슬랙 앱 만들기
+### 1. 슬랙 앱 만들기 (매니페스트로 한 번에)
 
-1. https://api.slack.com/apps → **Create New App** → **From scratch**
-2. **OAuth & Permissions** → Bot Token Scopes에 추가:
-   - `chat:write`
-   - `files:write`
+1. https://api.slack.com/apps → **Create New App** → **From an app manifest**
+2. 워크스페이스 선택 → `slack-app-manifest.yaml` 내용을 붙여넣기 (스코프가 자동 설정됨)
 3. **Install to Workspace** → `xoxb-`로 시작하는 **Bot User OAuth Token** 복사
-4. 메뉴를 받을 슬랙 채널에서 `/invite @봇이름` 으로 봇 초대
+4. 메뉴를 받을 슬랙 채널에서 `/invite @메뉴봇` 으로 봇 초대
 5. 채널 ID 확인: 채널 이름 클릭 → 하단의 `C`로 시작하는 ID 복사
+
+> 봇 이름/설명은 `slack-app-manifest.yaml`에서 바꿀 수 있다.
 
 ### 2. GitHub 설정
 
