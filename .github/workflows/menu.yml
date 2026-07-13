@@ -1,0 +1,51 @@
+name: menu-to-slack
+
+on:
+  schedule:
+    # UTC 기준. GitHub cron은 몇 분 지연될 수 있어 10분 일찍 시작하고,
+    # 스크립트가 정각(11:00 / 17:30 KST)까지 대기한 뒤 전송한다.
+    - cron: '50 1 * * 1-5'   # 중식 — 10:50 KST
+    - cron: '20 8 * * 1-5'   # 석식 — 17:20 KST
+  workflow_dispatch:
+    inputs:
+      meal:
+        description: '어느 끼니를 보낼지'
+        required: true
+        default: lunch
+        type: choice
+        options:
+          - lunch
+          - dinner
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install -r requirements.txt
+
+      - name: Determine meal
+        id: meal
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "meal=${{ inputs.meal }}" >> "$GITHUB_OUTPUT"
+          else
+            hour=$(TZ=Asia/Seoul date +%H)
+            if [ "$hour" -lt 14 ]; then
+              echo "meal=lunch" >> "$GITHUB_OUTPUT"
+            else
+              echo "meal=dinner" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Send menu to Slack
+        run: python menu_to_slack.py --meal "${{ steps.meal.outputs.meal }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}

@@ -1,0 +1,213 @@
+"""카카오톡 채널의 중식/석식 포스트를 슬랙 채널로 전송한다.
+
+사용법:
+    python menu_to_slack.py --meal lunch          # 정각(11:00 KST)까지 대기 후 전송
+    python menu_to_slack.py --meal dinner
+    python menu_to_slack.py --meal lunch --no-wait  # 대기 없이 즉시 폴링
+    python menu_to_slack.py --meal lunch --dry-run  # 슬랙 전송 없이 메시지만 출력
+
+필요 환경변수: SLACK_BOT_TOKEN, SLACK_CHANNEL_ID (dry-run 시 불필요)
+"""
+
+import argparse
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import requests
+
+KST = ZoneInfo("Asia/Seoul")
+KAKAO_POSTS_URL = "https://pf.kakao.com/rocket-web/web/profiles/_BxexgQb/posts"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+
+MEALS = {
+    "lunch": {"keyword": "중식", "send_at": (11, 0)},
+    "dinner": {"keyword": "석식", "send_at": (17, 30)},
+}
+
+POLL_INTERVAL = 5 * 60  # 5분
+POLL_TIMEOUT = 2 * 60 * 60  # 최대 2시간
+EXPECTED_POST_COUNT = 3  # 본식 / 샐러드인더키친 / T/O도시락&베이커리
+GRACE_POLL_DELAY = 90  # 본식 발견 후 나머지 포스트를 기다리는 추가 폴링 간격(초)
+
+
+def log(msg):
+    print(f"[{datetime.now(KST).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def fetch_posts():
+    resp = requests.get(
+        KAKAO_POSTS_URL, headers={"User-Agent": USER_AGENT}, timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json().get("items", [])
+
+
+def match_posts(posts, date_str, keyword):
+    """오늘 날짜 + 끼니 키워드가 제목에 있는 포스트만 반환 (고정 포스트 제외)."""
+    matched = []
+    for p in posts:
+        if p.get("pinned"):
+            continue
+        title = p.get("title", "")
+        if date_str in title and keyword in title:
+            matched.append(p)
+    return matched
+
+
+def has_main_post(posts, date_str, keyword):
+    """제목이 정확히 'N월N일 중식' 형태인 본식 포스트가 있는지 확인."""
+    for p in posts:
+        normalized = re.sub(r"\s+", "", p.get("title", ""))
+        if normalized == f"{date_str}{keyword}":
+            return True
+    return False
+
+
+def category_label(title, date_str, keyword):
+    """제목에서 날짜/끼니 접두어를 제거해 카테고리 라벨을 뽑는다."""
+    label = title.replace(date_str, "").replace(keyword, "").strip()
+    return label or keyword
+
+
+def build_message(posts, date_str, keyword):
+    # 본식 포스트를 맨 앞으로, 나머지는 API 순서 유지
+    def is_main(p):
+        return re.sub(r"\s+", "", p.get("title", "")) == f"{date_str}{keyword}"
+
+    ordered = sorted(posts, key=lambda p: 0 if is_main(p) else 1)
+
+    lines = [f"{date_str} {keyword}", ""]
+    for p in ordered:
+        items = []
+        for c in p.get("contents", []):
+            if c.get("t") == "text" and c.get("v"):
+                items.extend(
+                    line.strip() for line in c["v"].splitlines() if line.strip()
+                )
+        label = category_label(p["title"], date_str, keyword)
+        lines.append(f"[{label}] {' / '.join(items) if items else '(메뉴 텍스트 없음)'}")
+    return "\n".join(lines), ordered
+
+
+def collect_images(posts):
+    """모든 포스트의 이미지를 다운로드해 (filename, bytes) 리스트로 반환."""
+    images = []
+    for p in posts:
+        for i, m in enumerate(p.get("media", [])):
+            url = m.get("xlarge_url") or m.get("url")
+            if not url or m.get("type") != "image":
+                continue
+            try:
+                resp = requests.get(
+                    url, headers={"User-Agent": USER_AGENT}, timeout=30
+                )
+                resp.raise_for_status()
+                images.append((f"menu_{p['id']}_{i + 1}.jpg", resp.content))
+            except Exception as e:
+                log(f"이미지 다운로드 실패 (건너뜀): {url} — {e}")
+    return images
+
+
+def send_to_slack(message, images):
+    from slack_sdk import WebClient
+
+    token = os.environ["SLACK_BOT_TOKEN"]
+    channel = os.environ["SLACK_CHANNEL_ID"]
+    client = WebClient(token=token)
+
+    if images:
+        try:
+            client.files_upload_v2(
+                channel=channel,
+                initial_comment=message,
+                file_uploads=[
+                    {"content": data, "filename": name, "title": name}
+                    for name, data in images
+                ],
+            )
+            log(f"슬랙 전송 완료 (이미지 {len(images)}장 첨부)")
+            return
+        except Exception as e:
+            log(f"이미지 첨부 전송 실패, 텍스트만 전송으로 폴백: {e}")
+
+    client.chat_postMessage(channel=channel, text=message)
+    log("슬랙 전송 완료 (텍스트만)")
+
+
+def wait_until_send_time(meal):
+    hour, minute = MEALS[meal]["send_at"]
+    now = datetime.now(KST)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now < target:
+        wait = (target - now).total_seconds()
+        log(f"전송 시각 {target.strftime('%H:%M')} KST까지 {int(wait)}초 대기")
+        time.sleep(wait)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--meal", choices=MEALS, required=True)
+    parser.add_argument("--no-wait", action="store_true", help="정각 대기 없이 즉시 폴링")
+    parser.add_argument("--dry-run", action="store_true", help="슬랙 전송 없이 출력만")
+    args = parser.parse_args()
+
+    keyword = MEALS[args.meal]["keyword"]
+    now = datetime.now(KST)
+    date_str = f"{now.month}월{now.day}일"
+    log(f"대상: {date_str} {keyword}")
+
+    if not args.no_wait and not args.dry_run:
+        wait_until_send_time(args.meal)
+
+    deadline = time.monotonic() + POLL_TIMEOUT
+    matched = []
+    while True:
+        try:
+            posts = fetch_posts()
+            matched = match_posts(posts, date_str, keyword)
+        except Exception as e:
+            log(f"카카오 API 호출 실패: {e}")
+            matched = []
+
+        if matched and has_main_post(matched, date_str, keyword):
+            if len(matched) < EXPECTED_POST_COUNT:
+                # 카테고리 포스트가 몇 초 간격으로 올라오므로 잠깐 더 기다렸다 한 번 보완
+                log(
+                    f"본식 포함 {len(matched)}개 발견, {GRACE_POLL_DELAY}초 후 나머지 포스트 재확인"
+                )
+                time.sleep(GRACE_POLL_DELAY)
+                try:
+                    matched = match_posts(fetch_posts(), date_str, keyword)
+                except Exception as e:
+                    log(f"보완 폴링 실패, 현재까지 발견분으로 진행: {e}")
+            break
+
+        if time.monotonic() >= deadline:
+            if matched:
+                log("타임아웃 — 본식 포스트는 없지만 발견된 포스트로 진행")
+                break
+            log(f"타임아웃({POLL_TIMEOUT // 60}분) — {date_str} {keyword} 포스트 없음, 종료")
+            sys.exit(0)
+
+        log(f"{date_str} {keyword} 포스트 미발견, {POLL_INTERVAL // 60}분 후 재시도")
+        time.sleep(POLL_INTERVAL)
+
+    message, ordered = build_message(matched, date_str, keyword)
+    log(f"포스트 {len(ordered)}개 매칭:\n{message}")
+
+    images = collect_images(ordered)
+    log(f"이미지 {len(images)}장 다운로드 완료")
+
+    if args.dry_run:
+        log("dry-run 모드 — 슬랙 전송 생략")
+        return
+
+    send_to_slack(message, images)
+
+
+if __name__ == "__main__":
+    main()
