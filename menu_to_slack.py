@@ -124,18 +124,25 @@ def collect_images(posts):
 def already_sent(client, channel, header_line):
     """채널에 오늘 같은 끼니(header_line으로 시작하는 봇 메시지)가 이미 있으면 True.
 
-    중복 전송 방지용. 조회 실패 시(스코프 누락 등)엔 경고만 남기고 False를 반환해
-    전송은 진행한다 — 누락보다 중복이 덜 나쁘고, 확인 불가 상황은 로그로 드러난다.
+    중복 전송 방지용. 네트워크 오류(IncompleteRead 등)에 대비해 여러 번 재시도하고,
+    끝까지 조회에 실패하면 안전하게 True를 반환해 전송을 보류한다 — 중복보다 누락이
+    낫고, 누락은 다음 백업 크론 실행이 재시도로 메운다. limit은 응답 크기(첨부 메타로
+    커짐)를 줄여 IncompleteRead를 완화하려고 작게 잡는다.
     """
-    try:
-        resp = client.conversations_history(channel=channel, limit=50)
-    except Exception as e:
-        log(f"중복 확인 실패(전송은 진행): {e}")
-        return False
-    for msg in resp.get("messages", []):
-        if msg.get("bot_id") and msg.get("text", "").startswith(header_line):
-            return True
-    return False
+    last_err = None
+    for attempt in range(4):
+        try:
+            resp = client.conversations_history(channel=channel, limit=15)
+            for msg in resp.get("messages", []):
+                if msg.get("bot_id") and msg.get("text", "").startswith(header_line):
+                    return True
+            return False
+        except Exception as e:
+            last_err = e
+            log(f"중복 확인 재시도 {attempt + 1}/4: {e}")
+            time.sleep(2)
+    log(f"중복 확인 4회 실패 — 중복 방지 위해 전송 보류(백업 크론이 재시도): {last_err}")
+    return True
 
 
 def send_to_slack(message, images):
