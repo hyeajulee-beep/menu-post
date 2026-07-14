@@ -18,7 +18,19 @@
 4. 메뉴를 받을 슬랙 채널에서 `/invite @메뉴봇` 으로 봇 초대
 5. 채널 ID 확인: 채널 이름 클릭 → 하단의 `C`로 시작하는 ID 복사
 
+봇 스코프(매니페스트에 포함): `chat:write`, `files:write`, `channels:history`, `groups:history`
+— 뒤 두 개는 **중복 전송 방지**를 위해 채널 기록을 읽는 데 쓴다.
+
 > 봇 이름/설명은 `slack-app-manifest.yaml`에서 바꿀 수 있다.
+
+#### 기존 앱에 스코프를 추가할 때 (재설치 필요)
+
+봇에 새 권한(scope)을 추가하면 반드시 재설치해야 새 토큰에 반영된다.
+
+1. https://api.slack.com/apps → 해당 앱 → **OAuth & Permissions** → Bot Token Scopes에
+   `channels:history`, `groups:history` 추가
+2. 상단 배너의 **Reinstall to Workspace** → 새 `xoxb-` 토큰 복사
+3. GitHub Secret 갱신: `gh secret set SLACK_BOT_TOKEN --repo <owner>/menu-post --body '<새 토큰>'`
 
 ### 2. GitHub 설정
 
@@ -50,6 +62,9 @@ python menu_to_slack.py --meal lunch --no-wait
   (상단 고정 주간메뉴표는 제외)
 - 본식 포스트 발견 시 나머지 카테고리 포스트(샐러드인더키친, T/O도시락&베이커리)를
   90초 더 기다렸다가 한 메시지로 합쳐 전송
+- **중복 방지(멱등성)**: 전송 직전 채널 최근 메시지를 조회해, 오늘 같은 끼니(`N월N일 끼니`로
+  시작하는 봇 메시지)가 이미 있으면 전송을 생략 — 크론이 뒤늦게 또 발동하거나 수동+자동이
+  겹쳐도 같은 끼니를 두 번 올리지 않는다
 - 이미지 첨부 실패 시 텍스트만이라도 전송
 
 ## 알려진 제약

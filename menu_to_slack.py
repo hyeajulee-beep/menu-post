@@ -121,12 +121,34 @@ def collect_images(posts):
     return images, skipped
 
 
+def already_sent(client, channel, header_line):
+    """채널에 오늘 같은 끼니(header_line으로 시작하는 봇 메시지)가 이미 있으면 True.
+
+    중복 전송 방지용. 조회 실패 시(스코프 누락 등)엔 경고만 남기고 False를 반환해
+    전송은 진행한다 — 누락보다 중복이 덜 나쁘고, 확인 불가 상황은 로그로 드러난다.
+    """
+    try:
+        resp = client.conversations_history(channel=channel, limit=50)
+    except Exception as e:
+        log(f"중복 확인 실패(전송은 진행): {e}")
+        return False
+    for msg in resp.get("messages", []):
+        if msg.get("bot_id") and msg.get("text", "").startswith(header_line):
+            return True
+    return False
+
+
 def send_to_slack(message, images):
     from slack_sdk import WebClient
 
     token = os.environ["SLACK_BOT_TOKEN"]
     channel = os.environ["SLACK_CHANNEL_ID"]
     client = WebClient(token=token)
+
+    header_line = message.splitlines()[0]
+    if already_sent(client, channel, header_line):
+        log(f"'{header_line}' 이미 전송됨 — 중복 방지로 생략")
+        return
 
     if images:
         try:
