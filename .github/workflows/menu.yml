@@ -20,6 +20,11 @@ on:
         options:
           - lunch
           - dinner
+  # 외부 스케줄러(cron-job.org 등)가 정시에 호출하는 주 트리거.
+  # GitHub 자체 크론이 정시에 잘 안 떠서 도입. event_type(lunch/dinner)으로 끼니 지정.
+  # 위 schedule 크론은 외부 호출이 실패할 때를 위한 백업으로 유지(멱등성으로 중복 방지).
+  repository_dispatch:
+    types: [lunch, dinner]
 
 jobs:
   send:
@@ -39,6 +44,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "meal=${{ inputs.meal }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "meal=${{ github.event.action }}" >> "$GITHUB_OUTPUT"
           else
             hour=$(TZ=Asia/Seoul date +%H)
             if [ "$hour" -lt 14 ]; then

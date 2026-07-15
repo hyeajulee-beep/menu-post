@@ -40,6 +40,29 @@
    - `SLACK_CHANNEL_ID`: 채널 ID
 3. **Actions** 탭 → `menu-to-slack` → **Run workflow** 로 수동 실행해 동작 확인
 
+### 3. 정시 실행용 외부 스케줄러 (cron-job.org)
+
+GitHub 자체 크론은 정시 발동이 매우 불안정하다(수십 분~수 시간 지연/누락 빈번).
+정확한 정시 실행을 위해 외부 무료 스케줄러가 `repository_dispatch`로 워크플로를 호출한다.
+
+1. **GitHub PAT 발급**: https://github.com/settings/tokens → **Fine-grained token**
+   - Repository access: `menu-post`만 선택
+   - Permissions → **Contents: Read and write** (repository_dispatch 트리거에 필요)
+   - 만료일 설정 후 토큰 복사
+2. **cron-job.org 가입(무료)** → 크론잡 2개 생성. 공통 설정:
+   - URL: `https://api.github.com/repos/hyeajulee-beep/menu-post/dispatches`
+   - Method: `POST`
+   - Request headers:
+     - `Accept: application/vnd.github+json`
+     - `Authorization: Bearer <위에서 발급한 PAT>`
+     - `X-GitHub-Api-Version: 2022-11-28`
+   - Timezone: `Asia/Seoul`
+   - 중식 잡: 평일(월~금) **11:00**, Request body `{"event_type":"lunch"}`
+   - 석식 잡: 평일(월~금) **17:30**, Request body `{"event_type":"dinner"}`
+3. 저장 후 cron-job.org의 **TEST RUN**으로 즉시 한 번 호출 → Actions 탭에 `repository_dispatch` 실행이 뜨는지 확인
+
+> GitHub 크론(백업)은 그대로 둔다 — 외부 호출과 겹쳐도 멱등성으로 중복이 나지 않는다.
+
 ## 로컬 테스트
 
 ```bash
