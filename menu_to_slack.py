@@ -24,13 +24,12 @@ KAKAO_POSTS_URL = "https://pf.kakao.com/rocket-web/web/profiles/_BxexgQb/posts"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
 
 MEALS = {
-    "lunch": {"keyword": "중식", "send_at": (11, 0)},
-    "dinner": {"keyword": "석식", "send_at": (17, 30)},
+    "lunch": {"keyword": "중식", "send_at": (11, 0), "expected_posts": 3},
+    "dinner": {"keyword": "석식", "send_at": (17, 30), "expected_posts": 2},
 }
 
 POLL_INTERVAL = 5 * 60  # 5분
 POLL_TIMEOUT = 2 * 60 * 60  # 최대 2시간
-EXPECTED_POST_COUNT = 3  # 본식 / 샐러드인더키친 / T/O도시락&베이커리
 GRACE_POLL_DELAY = 90  # 본식 발견 후 나머지 포스트를 기다리는 추가 폴링 간격(초)
 
 
@@ -46,37 +45,39 @@ def fetch_posts():
     return resp.json().get("items", [])
 
 
-def match_posts(posts, date_str, keyword):
-    """오늘 날짜 + 끼니 키워드가 제목에 있는 포스트만 반환 (고정 포스트 제외)."""
+def match_posts(posts, date_re, keyword):
+    """오늘 날짜 + 끼니 키워드가 제목에 있는 포스트만 반환 (고정 포스트 제외).
+
+    날짜는 '7월15일'/'7월15'/'7월 15' 등 표기 흔들림을 흡수하도록 정규식으로 매칭한다.
+    """
     matched = []
     for p in posts:
         if p.get("pinned"):
             continue
         title = p.get("title", "")
-        if date_str in title and keyword in title:
+        if date_re.search(title) and keyword in title:
             matched.append(p)
     return matched
 
 
-def has_main_post(posts, date_str, keyword):
-    """제목이 정확히 'N월N일 중식' 형태인 본식 포스트가 있는지 확인."""
-    for p in posts:
-        normalized = re.sub(r"\s+", "", p.get("title", ""))
-        if normalized == f"{date_str}{keyword}":
-            return True
-    return False
-
-
-def category_label(title, date_str, keyword):
-    """제목에서 날짜/끼니 접두어를 제거해 카테고리 라벨을 뽑는다."""
-    label = title.replace(date_str, "").replace(keyword, "").strip()
+def category_label(title, date_re, keyword):
+    """제목에서 날짜/끼니를 제거해 카테고리 라벨을 뽑는다 (없으면 끼니명)."""
+    label = date_re.sub("", title).replace(keyword, "").strip()
     return label or keyword
 
 
-def build_message(posts, date_str, keyword):
+def has_main_post(posts, date_re, keyword):
+    """본식(날짜+끼니 외 카테고리 접미어가 없는) 포스트가 있으면 True."""
+    return any(
+        category_label(p.get("title", ""), date_re, keyword) == keyword
+        for p in posts
+    )
+
+
+def build_message(posts, date_str, date_re, keyword):
     # 본식 포스트를 맨 앞으로, 나머지는 API 순서 유지
     def is_main(p):
-        return re.sub(r"\s+", "", p.get("title", "")) == f"{date_str}{keyword}"
+        return category_label(p.get("title", ""), date_re, keyword) == keyword
 
     ordered = sorted(posts, key=lambda p: 0 if is_main(p) else 1)
 
@@ -88,7 +89,7 @@ def build_message(posts, date_str, keyword):
                 items.extend(
                     line.strip() for line in c["v"].splitlines() if line.strip()
                 )
-        label = category_label(p["title"], date_str, keyword)
+        label = category_label(p["title"], date_re, keyword)
         lines.append(f"[{label}] {' / '.join(items) if items else '(메뉴 텍스트 없음)'}")
     return "\n".join(lines), ordered
 
@@ -196,6 +197,7 @@ def main():
     keyword = MEALS[args.meal]["keyword"]
     now = datetime.now(KST)
     date_str = f"{now.month}월{now.day}일"
+    date_re = re.compile(rf"{now.month}\s*월\s*{now.day}\s*일?")
     log(f"대상: {date_str} {keyword}")
 
     if not args.no_wait and not args.dry_run:
@@ -206,20 +208,20 @@ def main():
     while True:
         try:
             posts = fetch_posts()
-            matched = match_posts(posts, date_str, keyword)
+            matched = match_posts(posts, date_re, keyword)
         except Exception as e:
             log(f"카카오 API 호출 실패: {e}")
             matched = []
 
-        if matched and has_main_post(matched, date_str, keyword):
-            if len(matched) < EXPECTED_POST_COUNT:
+        if matched and has_main_post(matched, date_re, keyword):
+            if len(matched) < MEALS[args.meal]["expected_posts"]:
                 # 카테고리 포스트가 몇 초 간격으로 올라오므로 잠깐 더 기다렸다 한 번 보완
                 log(
                     f"본식 포함 {len(matched)}개 발견, {GRACE_POLL_DELAY}초 후 나머지 포스트 재확인"
                 )
                 time.sleep(GRACE_POLL_DELAY)
                 try:
-                    matched = match_posts(fetch_posts(), date_str, keyword)
+                    matched = match_posts(fetch_posts(), date_re, keyword)
                 except Exception as e:
                     log(f"보완 폴링 실패, 현재까지 발견분으로 진행: {e}")
             break
@@ -234,7 +236,7 @@ def main():
         log(f"{date_str} {keyword} 포스트 미발견, {POLL_INTERVAL // 60}분 후 재시도")
         time.sleep(POLL_INTERVAL)
 
-    message, ordered = build_message(matched, date_str, keyword)
+    message, ordered = build_message(matched, date_str, date_re, keyword)
     log(f"포스트 {len(ordered)}개 매칭:\n{message}")
 
     images, skipped = collect_images(ordered)
