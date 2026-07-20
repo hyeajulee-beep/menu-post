@@ -2,14 +2,14 @@ name: menu-to-slack
 
 on:
   schedule:
-    # UTC 기준. GitHub cron은 몇 분~수십 분 지연될 수 있어 정시보다 일찍 시작하고,
-    # 스크립트가 정각(11:00 / 17:30 KST)까지 대기한 뒤 전송한다.
-    # 백업 크론: 정시 실행이 실패/미발동해도 커버한다. 정시가 성공했으면
-    # 백업은 멱등성(채널 기록 확인)으로 자동 skip되어 중복이 나지 않는다.
-    - cron: '50 1 * * 1-5'   # 중식 정시 — 10:50 KST
-    - cron: '35 2 * * 1-5'   # 중식 백업 — 11:35 KST
-    - cron: '20 8 * * 1-5'   # 석식 정시 — 17:20 KST
-    - cron: '5 9 * * 1-5'    # 석식 백업 — 18:05 KST
+    # UTC 기준. 외부 스케줄러(cron-job.org)가 주 트리거이고, 아래는 그것이 실패/누락될
+    # 때를 위한 백업이다. 스크립트가 --once(1회 조회 후 종료)로 돌므로 각 run이 수초~90초
+    # 내 끝난다 — 메뉴 창(window) 동안 여러 번 짧게 발동해 커버한다. 이미 전송됐으면
+    # 멱등성(채널 기록 확인)으로 자동 skip되어 중복이 나지 않는다.
+    # (GitHub cron은 몇 분~수십 분 지연될 수 있어 정시 커버는 외부 스케줄러가 담당)
+    - cron: '0,15,30,45 2 * * 1-5'   # 중식 백업 — 11:00~11:45 KST 15분 간격
+    - cron: '20,35,50 8 * * 1-5'     # 석식 백업 — 17:20~17:50 KST 15분 간격
+    - cron: '5 9 * * 1-5'            # 석식 백업 — 18:05 KST
   workflow_dispatch:
     inputs:
       meal:
@@ -20,16 +20,16 @@ on:
         options:
           - lunch
           - dinner
-  # 외부 스케줄러(cron-job.org 등)가 정시에 호출하는 주 트리거.
+  # 외부 스케줄러(cron-job.org 등)가 메뉴 창 동안 10분 간격으로 호출하는 주 트리거.
   # GitHub 자체 크론이 정시에 잘 안 떠서 도입. event_type(lunch/dinner)으로 끼니 지정.
-  # 위 schedule 크론은 외부 호출이 실패할 때를 위한 백업으로 유지(멱등성으로 중복 방지).
+  # 각 호출마다 스크립트가 --once로 1회 조회 후 종료하고, 멱등성으로 중복 전송을 막는다.
   repository_dispatch:
     types: [lunch, dinner]
 
 jobs:
   send:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -56,7 +56,7 @@ jobs:
           fi
 
       - name: Send menu to Slack
-        run: python menu_to_slack.py --meal "${{ steps.meal.outputs.meal }}"
+        run: python menu_to_slack.py --meal "${{ steps.meal.outputs.meal }}" --once
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}

@@ -1,7 +1,8 @@
 """카카오톡 채널의 중식/석식 포스트를 슬랙 채널로 전송한다.
 
 사용법:
-    python menu_to_slack.py --meal lunch          # 정각(11:00 KST)까지 대기 후 전송
+    python menu_to_slack.py --meal lunch --once     # 카카오 1회 조회 후 종료(권장, 스케줄러가 반복)
+    python menu_to_slack.py --meal lunch            # 정각(11:00 KST)까지 대기 후 폴링(레거시)
     python menu_to_slack.py --meal dinner
     python menu_to_slack.py --meal lunch --no-wait  # 대기 없이 즉시 폴링
     python menu_to_slack.py --meal lunch --dry-run  # 슬랙 전송 없이 메시지만 출력
@@ -12,9 +13,8 @@
 import argparse
 import os
 import re
-import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -187,9 +187,73 @@ def wait_until_send_time(meal):
         time.sleep(wait)
 
 
+def grace_supplement(matched, date_re, keyword, meal):
+    """본식 발견 후 카테고리 포스트가 덜 올라왔으면 잠깐 더 기다렸다 한 번 보완한다."""
+    if len(matched) < MEALS[meal]["expected_posts"]:
+        # 카테고리 포스트가 몇 초 간격으로 올라오므로 잠깐 더 기다렸다 한 번 보완
+        log(f"본식 포함 {len(matched)}개 발견, {GRACE_POLL_DELAY}초 후 나머지 포스트 재확인")
+        time.sleep(GRACE_POLL_DELAY)
+        try:
+            matched = match_posts(fetch_posts(), date_re, keyword)
+        except Exception as e:
+            log(f"보완 폴링 실패, 현재까지 발견분으로 진행: {e}")
+    return matched
+
+
+def find_once(date_re, keyword, meal, date_str):
+    """카카오를 1회만 조회한다. 본식 포함 매칭이 있으면 (grace 보완 후) 반환, 없으면 [].
+
+    폴링은 하지 않는다 — 반복 시도는 외부 스케줄러/백업 크론의 실행 빈도가 담당한다.
+    """
+    try:
+        matched = match_posts(fetch_posts(), date_re, keyword)
+    except Exception as e:
+        log(f"카카오 API 호출 실패: {e}")
+        return []
+
+    if matched and has_main_post(matched, date_re, keyword):
+        return grace_supplement(matched, date_re, keyword, meal)
+
+    log(f"{date_str} {keyword} 아직 미게시(본식 포스트 없음) — 종료(다음 발동이 재시도)")
+    return []
+
+
+def poll_until_found(date_re, keyword, meal, date_str):
+    """본식 포스트가 올라올 때까지 5분 간격으로 최대 POLL_TIMEOUT 폴링한다(레거시 크론용).
+
+    발견 시 (grace 보완 후) 매칭을, 타임아웃 시 발견분(없으면 [])을 반환한다.
+    """
+    deadline = time.monotonic() + POLL_TIMEOUT
+    matched = []
+    while True:
+        try:
+            matched = match_posts(fetch_posts(), date_re, keyword)
+        except Exception as e:
+            log(f"카카오 API 호출 실패: {e}")
+            matched = []
+
+        if matched and has_main_post(matched, date_re, keyword):
+            return grace_supplement(matched, date_re, keyword, meal)
+
+        if time.monotonic() >= deadline:
+            if matched:
+                log("타임아웃 — 본식 포스트는 없지만 발견된 포스트로 진행")
+                return matched
+            log(f"타임아웃({POLL_TIMEOUT // 60}분) — {date_str} {keyword} 포스트 없음, 종료")
+            return []
+
+        log(f"{date_str} {keyword} 포스트 미발견, {POLL_INTERVAL // 60}분 후 재시도")
+        time.sleep(POLL_INTERVAL)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--meal", choices=MEALS, required=True)
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="카카오를 1회만 조회하고 종료(폴링 안 함). 반복 시도는 외부 스케줄러가 담당",
+    )
     parser.add_argument("--no-wait", action="store_true", help="정각 대기 없이 즉시 폴링")
     parser.add_argument("--dry-run", action="store_true", help="슬랙 전송 없이 출력만")
     args = parser.parse_args()
@@ -200,41 +264,15 @@ def main():
     date_re = re.compile(rf"{now.month}\s*월\s*{now.day}\s*일?")
     log(f"대상: {date_str} {keyword}")
 
-    if not args.no_wait and not args.dry_run:
-        wait_until_send_time(args.meal)
+    if args.once:
+        matched = find_once(date_re, keyword, args.meal, date_str)
+    else:
+        if not args.no_wait and not args.dry_run:
+            wait_until_send_time(args.meal)
+        matched = poll_until_found(date_re, keyword, args.meal, date_str)
 
-    deadline = time.monotonic() + POLL_TIMEOUT
-    matched = []
-    while True:
-        try:
-            posts = fetch_posts()
-            matched = match_posts(posts, date_re, keyword)
-        except Exception as e:
-            log(f"카카오 API 호출 실패: {e}")
-            matched = []
-
-        if matched and has_main_post(matched, date_re, keyword):
-            if len(matched) < MEALS[args.meal]["expected_posts"]:
-                # 카테고리 포스트가 몇 초 간격으로 올라오므로 잠깐 더 기다렸다 한 번 보완
-                log(
-                    f"본식 포함 {len(matched)}개 발견, {GRACE_POLL_DELAY}초 후 나머지 포스트 재확인"
-                )
-                time.sleep(GRACE_POLL_DELAY)
-                try:
-                    matched = match_posts(fetch_posts(), date_re, keyword)
-                except Exception as e:
-                    log(f"보완 폴링 실패, 현재까지 발견분으로 진행: {e}")
-            break
-
-        if time.monotonic() >= deadline:
-            if matched:
-                log("타임아웃 — 본식 포스트는 없지만 발견된 포스트로 진행")
-                break
-            log(f"타임아웃({POLL_TIMEOUT // 60}분) — {date_str} {keyword} 포스트 없음, 종료")
-            sys.exit(0)
-
-        log(f"{date_str} {keyword} 포스트 미발견, {POLL_INTERVAL // 60}분 후 재시도")
-        time.sleep(POLL_INTERVAL)
+    if not matched:
+        return
 
     message, ordered = build_message(matched, date_str, date_re, keyword)
     log(f"포스트 {len(ordered)}개 매칭:\n{message}")
