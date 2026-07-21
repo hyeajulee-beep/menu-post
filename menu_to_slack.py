@@ -32,6 +32,19 @@ POLL_INTERVAL = 5 * 60  # 5분
 POLL_TIMEOUT = 2 * 60 * 60  # 최대 2시간
 GRACE_POLL_DELAY = 90  # 본식 발견 후 나머지 포스트를 기다리는 추가 폴링 간격(초)
 
+# 재시도·보류가 무의미한 영구(인증/설정) 오류 — 삼키지 않고 즉시 실패로 노출한다.
+FATAL_SLACK_ERRORS = {
+    "account_inactive",
+    "token_revoked",
+    "token_expired",
+    "invalid_auth",
+    "not_authed",
+    "channel_not_found",
+    "not_in_channel",
+    "is_archived",
+    "missing_scope",
+}
+
 
 def log(msg):
     print(f"[{datetime.now(KST).strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -129,7 +142,12 @@ def already_sent(client, channel, header_line):
     끝까지 조회에 실패하면 안전하게 True를 반환해 전송을 보류한다 — 중복보다 누락이
     낫고, 누락은 다음 백업 크론 실행이 재시도로 메운다. limit은 응답 크기(첨부 메타로
     커짐)를 줄여 IncompleteRead를 완화하려고 작게 잡는다.
+
+    단, 인증/설정 오류(FATAL_SLACK_ERRORS)는 재시도·보류가 무의미하므로 삼키지 않고
+    그대로 raise한다 — 조용히 "이미 전송됨"으로 위장돼 run이 success로 뜨는 걸 막는다.
     """
+    from slack_sdk.errors import SlackApiError
+
     last_err = None
     for attempt in range(4):
         try:
@@ -138,6 +156,12 @@ def already_sent(client, channel, header_line):
                 if msg.get("bot_id") and msg.get("text", "").startswith(header_line):
                     return True
             return False
+        except SlackApiError as e:
+            if e.response.get("error") in FATAL_SLACK_ERRORS:
+                raise
+            last_err = e
+            log(f"중복 확인 재시도 {attempt + 1}/4: {e}")
+            time.sleep(2)
         except Exception as e:
             last_err = e
             log(f"중복 확인 재시도 {attempt + 1}/4: {e}")
@@ -152,6 +176,11 @@ def send_to_slack(message, images):
     token = os.environ["SLACK_BOT_TOKEN"]
     channel = os.environ["SLACK_CHANNEL_ID"]
     client = WebClient(token=token)
+
+    # 토큰 유효성을 먼저 확인해 무효 토큰이면 여기서 바로(명확히) 실패시킨다.
+    # 이렇게 안 하면 인증 오류가 "이미 전송됨"으로 위장돼 run이 조용히 success로 뜬다.
+    auth = client.auth_test()
+    log(f"봇 {auth.get('user')} 인증 확인 (team: {auth.get('team')})")
 
     header_line = message.splitlines()[0]
     if already_sent(client, channel, header_line):
