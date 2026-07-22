@@ -2,16 +2,17 @@ name: menu-to-slack
 
 on:
   schedule:
-    # UTC 기준. 외부 스케줄러(cron-job.org)가 주 트리거이고, 아래는 그것이 실패/누락될
-    # 때를 위한 백업이다. 스크립트가 --once(1회 조회 후 종료)로 돌므로 각 run이 수초~90초
-    # 내 끝난다 — 메뉴 창(window) 동안 여러 번 짧게 발동해 커버한다. 이미 전송됐으면
-    # 멱등성(채널 기록 확인)으로 자동 skip되어 중복이 나지 않는다.
-    # (GitHub cron은 몇 분~수십 분 지연될 수 있어 정시 커버는 외부 스케줄러가 담당)
-    - cron: '0,15,30,45 2 * * 1-5'      # 중식 백업 — 11:00~11:45 KST 15분 간격
-    - cron: '0,15,30,45 3 * * 1-5'      # 중식 백업(연장) — 12:00~12:45 KST
-    - cron: '15,30,45 8 * * 1-5'        # 석식 백업 — 17:15~17:45 KST 15분 간격
-    - cron: '0,15,30,45 9 * * 1-5'      # 석식 백업 — 18:00~18:45 KST 15분 간격
-    - cron: '0 10 * * 1-5'              # 석식 백업(연장) — 19:00 KST
+    # UTC 기준. 외부 스케줄러(cron-job.org)가 빠른 정상 경로이고, 아래 GitHub 크론은 그것이
+    # 실패/누락될 때의 '자립형 백스톱'이다. GitHub 크론은 발동 자체가 지연·누락되기 쉬우므로
+    # (촘촘히 깔아도 하나도 안 뜰 수 있음), schedule로 뜬 run은 --once(1회 조회)가 아니라
+    # 바운드 폴링(--no-wait --max-wait 50)으로 돈다 — 창 초입에 '한 번만' 떠도 카카오 게시
+    # 시점까지 폴링해 잡는다. 이미 전송됐으면 멱등성(채널 기록 확인)으로 즉시 skip해 중복 없음.
+    # 창 초입을 5분 간격으로 촘촘히 깐다 — 11:00 크론이 드롭돼도 11:05가 폴링을 시작하도록.
+    # 어느 하나가 뜨면 그 run이 50분 폴링으로 나머지를 덮고, 뒤이어 뜬 크론은 concurrency로
+    # 큐잉됐다 already_sent로 빠르게 skip하므로 촘촘해도 러너 낭비가 없다.
+    - cron: '0,5,10,15,20,40 2 * * 1-5' # 중식 백스톱 — 11:00~11:20 5분 간격 + 11:40 → 각 50분 폴링
+    - cron: '30,35,40,45,50 8 * * 1-5'  # 석식 백스톱 — 17:30~17:50 5분 간격 → 각 50분 폴링
+    - cron: '10 9 * * 1-5'              # 석식 백스톱 — 18:10 KST 진입 → 50분 폴링
   workflow_dispatch:
     inputs:
       meal:
@@ -28,10 +29,18 @@ on:
   repository_dispatch:
     types: [lunch, dinner]
 
+# 중식·석식 창은 시간대가 겹치지 않으므로 워크플로 전체에 단일 그룹이면 충분하다.
+# cancel-in-progress: false — 폴링 중인 백스톱 run을 죽이지 않고, 뒤에 겹친 트리거는
+# 큐잉됐다가 already_sent로 빠르게 skip → 러너 다중 점유 방지.
+concurrency:
+  group: menu-to-slack
+  cancel-in-progress: false
+
 jobs:
   send:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 백스톱 바운드 폴링(최대 50분) + 시작 오버헤드를 수용. --once/dispatch는 수초 내 끝난다.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
@@ -41,9 +50,10 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Determine meal
+      - name: Determine meal and run mode
         id: meal
         run: |
+          # 끼니 결정
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "meal=${{ inputs.meal }}" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
@@ -56,9 +66,15 @@ jobs:
               echo "meal=dinner" >> "$GITHUB_OUTPUT"
             fi
           fi
+          # 실행 모드: schedule(백스톱)만 바운드 폴링, 나머지(외부 dispatch/수동)는 빠른 --once
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "mode=--no-wait --max-wait 50" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=--once" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Send menu to Slack
-        run: python menu_to_slack.py --meal "${{ steps.meal.outputs.meal }}" --once
+        run: python menu_to_slack.py --meal "${{ steps.meal.outputs.meal }}" ${{ steps.meal.outputs.mode }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}

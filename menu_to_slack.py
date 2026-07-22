@@ -1,11 +1,11 @@
 """카카오톡 채널의 중식/석식 포스트를 슬랙 채널로 전송한다.
 
 사용법:
-    python menu_to_slack.py --meal lunch --once     # 카카오 1회 조회 후 종료(권장, 스케줄러가 반복)
-    python menu_to_slack.py --meal lunch            # 정각(11:00 KST)까지 대기 후 폴링(레거시)
+    python menu_to_slack.py --meal lunch --once            # 카카오 1회 조회 후 종료(빠른 정상 경로)
+    python menu_to_slack.py --meal lunch                   # 정각(11:00 KST)까지 대기 후 폴링(레거시)
     python menu_to_slack.py --meal dinner
-    python menu_to_slack.py --meal lunch --no-wait  # 대기 없이 즉시 폴링
-    python menu_to_slack.py --meal lunch --dry-run  # 슬랙 전송 없이 메시지만 출력
+    python menu_to_slack.py --meal lunch --no-wait --max-wait 50  # 창 전체를 덮는 바운드 폴링(백스톱)
+    python menu_to_slack.py --meal lunch --dry-run         # 슬랙 전송 없이 메시지만 출력
 
 필요 환경변수: SLACK_BOT_TOKEN, SLACK_CHANNEL_ID (dry-run 시 불필요)
 """
@@ -247,12 +247,12 @@ def find_once(date_re, keyword, meal, date_str):
     return []
 
 
-def poll_until_found(date_re, keyword, meal, date_str):
-    """본식 포스트가 올라올 때까지 5분 간격으로 최대 POLL_TIMEOUT 폴링한다(레거시 크론용).
+def poll_until_found(date_re, keyword, meal, date_str, timeout=POLL_TIMEOUT):
+    """본식 포스트가 올라올 때까지 5분 간격으로 최대 timeout초 폴링한다(백스톱 크론용).
 
     발견 시 (grace 보완 후) 매칭을, 타임아웃 시 발견분(없으면 [])을 반환한다.
     """
-    deadline = time.monotonic() + POLL_TIMEOUT
+    deadline = time.monotonic() + timeout
     matched = []
     while True:
         try:
@@ -268,7 +268,7 @@ def poll_until_found(date_re, keyword, meal, date_str):
             if matched:
                 log("타임아웃 — 본식 포스트는 없지만 발견된 포스트로 진행")
                 return matched
-            log(f"타임아웃({POLL_TIMEOUT // 60}분) — {date_str} {keyword} 포스트 없음, 종료")
+            log(f"타임아웃({timeout // 60}분) — {date_str} {keyword} 포스트 없음, 종료")
             return []
 
         log(f"{date_str} {keyword} 포스트 미발견, {POLL_INTERVAL // 60}분 후 재시도")
@@ -284,6 +284,13 @@ def main():
         help="카카오를 1회만 조회하고 종료(폴링 안 함). 반복 시도는 외부 스케줄러가 담당",
     )
     parser.add_argument("--no-wait", action="store_true", help="정각 대기 없이 즉시 폴링")
+    parser.add_argument(
+        "--max-wait",
+        type=int,
+        default=None,
+        metavar="분",
+        help="폴링 모드 최대 대기(분). 미지정 시 기본 2시간. --once에는 무영향",
+    )
     parser.add_argument("--dry-run", action="store_true", help="슬랙 전송 없이 출력만")
     args = parser.parse_args()
 
@@ -298,7 +305,8 @@ def main():
     else:
         if not args.no_wait and not args.dry_run:
             wait_until_send_time(args.meal)
-        matched = poll_until_found(date_re, keyword, args.meal, date_str)
+        timeout = args.max_wait * 60 if args.max_wait is not None else POLL_TIMEOUT
+        matched = poll_until_found(date_re, keyword, args.meal, date_str, timeout)
 
     if not matched:
         return
