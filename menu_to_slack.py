@@ -1,10 +1,11 @@
 """카카오톡 채널의 중식/석식 포스트를 슬랙 채널로 전송한다.
 
 사용법:
-    python menu_to_slack.py --meal lunch --once            # 카카오 1회 조회 후 종료(빠른 정상 경로)
+    python menu_to_slack.py --meal lunch --no-wait --max-wait 8   # 외부 dispatch 1건이 8분 창을 덮음
+    python menu_to_slack.py --meal lunch --no-wait --max-wait 50 --allow-partial  # 긴 백스톱 창
+    python menu_to_slack.py --meal lunch --once            # 카카오 1회 조회 후 종료(수동 실행용)
     python menu_to_slack.py --meal lunch                   # 정각(11:00 KST)까지 대기 후 폴링(레거시)
     python menu_to_slack.py --meal dinner
-    python menu_to_slack.py --meal lunch --no-wait --max-wait 50  # 창 전체를 덮는 바운드 폴링(백스톱)
     python menu_to_slack.py --meal lunch --dry-run         # 슬랙 전송 없이 메시지만 출력
 
 필요 환경변수: SLACK_BOT_TOKEN, SLACK_CHANNEL_ID (dry-run 시 불필요)
@@ -28,7 +29,7 @@ MEALS = {
     "dinner": {"keyword": "석식", "send_at": (17, 30), "expected_posts": 2},
 }
 
-POLL_INTERVAL = 5 * 60  # 5분
+POLL_INTERVAL = 2 * 60  # 2분 — 짧은 폴링 창(--max-wait 8)에서도 5회 조회되도록
 POLL_TIMEOUT = 2 * 60 * 60  # 최대 2시간
 GRACE_POLL_DELAY = 90  # 본식 발견 후 나머지 포스트를 기다리는 추가 폴링 간격(초)
 
@@ -247,10 +248,17 @@ def find_once(date_re, keyword, meal, date_str):
     return []
 
 
-def poll_until_found(date_re, keyword, meal, date_str, timeout=POLL_TIMEOUT):
-    """본식 포스트가 올라올 때까지 5분 간격으로 최대 timeout초 폴링한다(백스톱 크론용).
+def poll_until_found(
+    date_re, keyword, meal, date_str, timeout=POLL_TIMEOUT, allow_partial=False
+):
+    """본식 포스트가 올라올 때까지 POLL_INTERVAL 간격으로 최대 timeout초 폴링한다.
 
-    발견 시 (grace 보완 후) 매칭을, 타임아웃 시 발견분(없으면 [])을 반환한다.
+    발견 시 (grace 보완 후) 매칭을 반환한다. 타임아웃 시에는 allow_partial일 때만
+    본식 없는 발견분으로 진행하고, 아니면 []를 반환해 다음 트리거가 재시도하게 한다.
+
+    짧은 폴링 창(외부 dispatch)에서 부분 전송을 허용하면, 카테고리 포스트만 올라온
+    수십 초 사이에 창이 끝났을 때 불완전한 메시지가 나가고 그 뒤 already_sent가 완전한
+    메시지를 영구 차단한다. 그래서 부분 전송은 최후의 수단인 긴 백스톱 창에만 허용한다.
     """
     deadline = time.monotonic() + timeout
     matched = []
@@ -265,9 +273,15 @@ def poll_until_found(date_re, keyword, meal, date_str, timeout=POLL_TIMEOUT):
             return grace_supplement(matched, date_re, keyword, meal)
 
         if time.monotonic() >= deadline:
-            if matched:
+            if matched and allow_partial:
                 log("타임아웃 — 본식 포스트는 없지만 발견된 포스트로 진행")
                 return matched
+            if matched:
+                log(
+                    f"타임아웃({timeout // 60}분) — 본식 포스트 없음(카테고리 "
+                    f"{len(matched)}개만 발견), 부분 전송 안 함 — 다음 발동이 재시도"
+                )
+                return []
             log(f"타임아웃({timeout // 60}분) — {date_str} {keyword} 포스트 없음, 종료")
             return []
 
@@ -291,6 +305,11 @@ def main():
         metavar="분",
         help="폴링 모드 최대 대기(분). 미지정 시 기본 2시간. --once에는 무영향",
     )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="폴링 타임아웃 시 본식 포스트가 없어도 발견분으로 전송(긴 백스톱 창 전용)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="슬랙 전송 없이 출력만")
     args = parser.parse_args()
 
@@ -306,7 +325,9 @@ def main():
         if not args.no_wait and not args.dry_run:
             wait_until_send_time(args.meal)
         timeout = args.max_wait * 60 if args.max_wait is not None else POLL_TIMEOUT
-        matched = poll_until_found(date_re, keyword, args.meal, date_str, timeout)
+        matched = poll_until_found(
+            date_re, keyword, args.meal, date_str, timeout, args.allow_partial
+        )
 
     if not matched:
         return

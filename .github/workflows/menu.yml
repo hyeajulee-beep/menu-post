@@ -66,9 +66,17 @@ jobs:
               echo "meal=dinner" >> "$GITHUB_OUTPUT"
             fi
           fi
-          # 실행 모드: schedule(백스톱)만 바운드 폴링, 나머지(외부 dispatch/수동)는 빠른 --once
+          # 실행 모드
+          #  - schedule(최후 백스톱): 50분 바운드 폴링. 타임아웃 시 본식이 없어도 발견분 전송
+          #  - repository_dispatch(주 경로): 8분 바운드 폴링. 발견 즉시 종료하므로 보통 수초.
+          #    외부 스케줄러가 단발로 발동해도 창 초입 8분은 이 run 하나가 덮는다 —
+          #    2026-07-27 중식은 11:00:34 단발 조회가 11:03 게시를 3분 차로 놓쳐 누락됐다.
+          #    10분 간격이 정상 동작할 땐 창이 겹치지 않고 타일링돼 러너 낭비도 없다.
+          #  - workflow_dispatch(수동): 즉시 끝나야 하므로 --once
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "mode=--no-wait --max-wait 50" >> "$GITHUB_OUTPUT"
+            echo "mode=--no-wait --max-wait 50 --allow-partial" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "mode=--no-wait --max-wait 8" >> "$GITHUB_OUTPUT"
           else
             echo "mode=--once" >> "$GITHUB_OUTPUT"
           fi
