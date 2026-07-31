@@ -23,6 +23,11 @@ on:
         options:
           - lunch
           - dinner
+      resend:
+        description: '기존 메시지 삭제 후 재전송'
+        required: false
+        default: false
+        type: boolean
   # 외부 스케줄러(cron-job.org 등)가 메뉴 창 동안 10분 간격으로 호출하는 주 트리거.
   # GitHub 자체 크론이 정시에 잘 안 떠서 도입. event_type(lunch/dinner)으로 끼니 지정.
   # 각 호출마다 스크립트가 --once로 1회 조회 후 종료하고, 멱등성으로 중복 전송을 막는다.
@@ -72,11 +77,14 @@ jobs:
           #    외부 스케줄러가 단발로 발동해도 창 초입 8분은 이 run 하나가 덮는다 —
           #    2026-07-27 중식은 11:00:34 단발 조회가 11:03 게시를 3분 차로 놓쳐 누락됐다.
           #    10분 간격이 정상 동작할 땐 창이 겹치지 않고 타일링돼 러너 낭비도 없다.
-          #  - workflow_dispatch(수동): 즉시 끝나야 하므로 --once
+          #  - workflow_dispatch(수동): 즉시 끝나야 하므로 --once. resend=true면 기존
+          #    메시지를 지우고 다시 보낸다(이미지 누락 등으로 재전송이 필요할 때).
           if [ "${{ github.event_name }}" = "schedule" ]; then
             echo "mode=--no-wait --max-wait 50 --allow-partial" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             echo "mode=--no-wait --max-wait 8" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.resend }}" = "true" ]; then
+            echo "mode=--once --resend" >> "$GITHUB_OUTPUT"
           else
             echo "mode=--once" >> "$GITHUB_OUTPUT"
           fi

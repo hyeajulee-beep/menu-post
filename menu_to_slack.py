@@ -7,6 +7,7 @@
     python menu_to_slack.py --meal lunch                   # 정각(11:00 KST)까지 대기 후 폴링(레거시)
     python menu_to_slack.py --meal dinner
     python menu_to_slack.py --meal lunch --dry-run         # 슬랙 전송 없이 메시지만 출력
+    python menu_to_slack.py --meal lunch --once --resend   # 기존 메시지 삭제 후 재전송
 
 필요 환경변수: SLACK_BOT_TOKEN, SLACK_CHANNEL_ID (dry-run 시 불필요)
 """
@@ -32,6 +33,11 @@ MEALS = {
 POLL_INTERVAL = 2 * 60  # 2분 — 짧은 폴링 창(--max-wait 8)에서도 5회 조회되도록
 POLL_TIMEOUT = 2 * 60 * 60  # 최대 2시간
 GRACE_POLL_DELAY = 90  # 본식 발견 후 나머지 포스트를 기다리는 추가 폴링 간격(초)
+
+# 카카오가 성인인증 잠금(adult_only) 등으로 가린 이미지는 실사진 대신 수 KB짜리
+# 회색 placeholder를 내려준다 (2026-07-31 본식 포스트: 2,907B). 정상 음식 사진은
+# 수십~수백 KB이므로 이 미만은 placeholder로 간주해 첨부하지 않는다.
+MIN_IMAGE_BYTES = 10 * 1024
 
 # 재시도·보류가 무의미한 영구(인증/설정) 오류 — 삼키지 않고 즉시 실패로 노출한다.
 FATAL_SLACK_ERRORS = {
@@ -117,6 +123,11 @@ def collect_images(posts):
     images = []
     skipped = 0
     for p in posts:
+        if p.get("adult_only"):
+            log(
+                f"주의: '{p.get('title', '').strip()}' 포스트가 성인인증 잠금 상태 — "
+                "비로그인 API에는 실사진 대신 placeholder만 내려옴"
+            )
         for i, m in enumerate(p.get("media", [])):
             url = m.get("xlarge_url") or m.get("url")
             if not url or m.get("type") != "image":
@@ -130,6 +141,9 @@ def collect_images(posts):
                     url, headers={"User-Agent": USER_AGENT}, timeout=30
                 )
                 resp.raise_for_status()
+                if len(resp.content) < MIN_IMAGE_BYTES:
+                    log(f"placeholder 의심 이미지 제외 ({len(resp.content)}B): {url}")
+                    continue
                 images.append((f"menu_{p['id']}_{i + 1}.jpg", resp.content))
             except Exception as e:
                 log(f"이미지 다운로드 실패 (건너뜀): {url} — {e}")
@@ -171,7 +185,33 @@ def already_sent(client, channel, header_line):
     return True
 
 
-def send_to_slack(message, images):
+def delete_existing(client, channel, header_line):
+    """header_line으로 시작하는 기존 봇 메시지와 그 첨부 파일을 삭제한다.
+
+    chat:write는 봇 자신의 메시지 삭제를, files:write는 봇이 올린 파일 삭제를
+    허용하므로 추가 스코프가 필요 없다. 메시지 삭제가 실패하면 raise한다 —
+    조용히 넘어가면 already_sent가 재전송을 차단해 run만 success로 위장된다.
+    """
+    from slack_sdk.errors import SlackApiError
+
+    deleted = 0
+    resp = client.conversations_history(channel=channel, limit=15)
+    for msg in resp.get("messages", []):
+        if not (msg.get("bot_id") and msg.get("text", "").startswith(header_line)):
+            continue
+        client.chat_delete(channel=channel, ts=msg["ts"])
+        deleted += 1
+        log(f"기존 메시지 삭제: ts={msg['ts']}")
+        for f in msg.get("files", []):
+            try:
+                client.files_delete(file=f["id"])
+            except SlackApiError as e:
+                log(f"첨부 파일 삭제 실패(무시): {f.get('id')} — {e.response.get('error')}")
+    if not deleted:
+        log(f"'{header_line}' 기존 메시지 없음 — 삭제 생략")
+
+
+def send_to_slack(message, images, resend=False):
     from slack_sdk import WebClient
 
     token = os.environ["SLACK_BOT_TOKEN"]
@@ -184,7 +224,10 @@ def send_to_slack(message, images):
     log(f"봇 {auth.get('user')} 인증 확인 (team: {auth.get('team')})")
 
     header_line = message.splitlines()[0]
-    if already_sent(client, channel, header_line):
+    if resend:
+        # 삭제 직후 채널 기록 조회는 레이스가 있으므로 already_sent 체크는 건너뛴다.
+        delete_existing(client, channel, header_line)
+    elif already_sent(client, channel, header_line):
         log(f"'{header_line}' 이미 전송됨 — 중복 방지로 생략")
         return
 
@@ -310,6 +353,11 @@ def main():
         action="store_true",
         help="폴링 타임아웃 시 본식 포스트가 없어도 발견분으로 전송(긴 백스톱 창 전용)",
     )
+    parser.add_argument(
+        "--resend",
+        action="store_true",
+        help="전송 전에 오늘 같은 끼니의 기존 봇 메시지를 삭제하고 다시 전송(--once와 함께 사용)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="슬랙 전송 없이 출력만")
     args = parser.parse_args()
 
@@ -342,7 +390,7 @@ def main():
         log("dry-run 모드 — 슬랙 전송 생략")
         return
 
-    send_to_slack(message, images)
+    send_to_slack(message, images, resend=args.resend)
 
 
 if __name__ == "__main__":
