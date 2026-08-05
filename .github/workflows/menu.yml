@@ -10,6 +10,8 @@ on:
     # 창 초입을 5분 간격으로 촘촘히 깐다 — 11:00 크론이 드롭돼도 11:05가 폴링을 시작하도록.
     # 어느 하나가 뜨면 그 run이 50분 폴링으로 나머지를 덮고, 뒤이어 뜬 크론은 concurrency로
     # 큐잉됐다 already_sent로 빠르게 skip하므로 촘촘해도 러너 낭비가 없다.
+    # 주의: 끼니는 아래 'Determine meal' 스텝이 크론 문자열의 시(hour) 필드로 매핑한다
+    # (2시=중식, 8·9시=석식). 크론 시각을 바꾸면 그 매핑도 같이 고칠 것.
     - cron: '0,5,10,15,20,40 2 * * 1-5' # 중식 백스톱 — 11:00~11:20 5분 간격 + 11:40 → 각 50분 폴링
     - cron: '30,35,40,45,50 8 * * 1-5'  # 석식 백스톱 — 17:30~17:50 5분 간격 → 각 50분 폴링
     - cron: '10 9 * * 1-5'              # 석식 백스톱 — 18:10 KST 진입 → 50분 폴링
@@ -58,18 +60,25 @@ jobs:
       - name: Determine meal and run mode
         id: meal
         run: |
-          # 끼니 결정
+          # 끼니 결정. schedule은 발동 시각이 아니라 '어느 크론이 발동했는지'
+          # (github.event.schedule)로 판정한다 — 이 repo의 schedule은 상시 2~2.6시간
+          # 지연 배달되므로, 시각 기반이면 중식 백스톱이 14시 이후 도착해 dinner로
+          # 오판된다 (2026-07-21~08-05 관측: 중식 백스톱이 이 버그로 한 번도 못 보냄).
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "meal=${{ inputs.meal }}" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             echo "meal=${{ github.event.action }}" >> "$GITHUB_OUTPUT"
           else
-            hour=$(TZ=Asia/Seoul date +%H)
-            if [ "$hour" -lt 14 ]; then
-              echo "meal=lunch" >> "$GITHUB_OUTPUT"
-            else
-              echo "meal=dinner" >> "$GITHUB_OUTPUT"
-            fi
+            case "${{ github.event.schedule }}" in
+              *' 2 * * '*) meal=lunch ;;
+              *' 8 * * '*|*' 9 * * '*) meal=dinner ;;
+              *)
+                # 새 크론 추가 후 매핑 누락 시에만 쓰는 폴백(시각 기반, 지연에 취약)
+                hour=$(TZ=Asia/Seoul date +%H)
+                if [ "$hour" -lt 14 ]; then meal=lunch; else meal=dinner; fi
+                ;;
+            esac
+            echo "meal=$meal" >> "$GITHUB_OUTPUT"
           fi
           # 실행 모드
           #  - schedule(최후 백스톱): 50분 바운드 폴링. 타임아웃 시 본식이 없어도 발견분 전송
