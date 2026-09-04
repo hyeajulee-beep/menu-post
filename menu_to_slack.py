@@ -65,19 +65,59 @@ def fetch_posts():
     return resp.json().get("items", [])
 
 
-def match_posts(posts, date_re, keyword):
-    """오늘 날짜 + 끼니 키워드가 제목에 있는 포스트만 반환 (고정 포스트 제외).
+def meal_of(title):
+    """제목에 들어 있는 끼니 키워드를 돌려준다 (없으면 None)."""
+    for cfg in MEALS.values():
+        if cfg["keyword"] in title:
+            return cfg["keyword"]
+    return None
 
-    날짜는 '7월15일'/'7월15'/'7월 15' 등 표기 흔들림을 흡수하도록 정규식으로 매칭한다.
+
+def resolve_meals(posts, date_re):
+    """오늘 포스트를 피드 순서대로 훑어 각 포스트의 끼니를 확정한다.
+
+    제목에 끼니 표기가 빠진 포스트(2026-09-04 '9월4일 샐러드인더키친')는 피드에서
+    앞뒤로 가장 가까운 끼니 확정 포스트의 끼니로 귀속한다. 하루 포스트는 끼니별로
+    연속된 묶음으로 올라오는데(카테고리들 → 본식 순, 묶음 사이 간격도 수십 초라
+    시간만으로는 경계를 못 가른다), 그래서 시간 간격보다 피드상의 인접 관계가
+    믿을 만하다. 앞뒤 끼니가 서로 다른 경계 위치라면 모호하므로 귀속하지 않고
+    경고만 남긴다 — 조용히 빠지는 것보다 로그에 드러나는 편이 낫다.
+
+    반환: [(post, 끼니 키워드 또는 None), ...] (피드 순서 유지)
     """
-    matched = []
-    for p in posts:
-        if p.get("pinned"):
+    today = [
+        p
+        for p in posts
+        if not p.get("pinned") and date_re.search(p.get("title", ""))
+    ]
+    meals = [meal_of(p.get("title", "")) for p in today]
+
+    resolved = list(meals)
+    for i, m in enumerate(meals):
+        if m is not None:
             continue
-        title = p.get("title", "")
-        if date_re.search(title) and keyword in title:
-            matched.append(p)
-    return matched
+        title = today[i].get("title", "").strip()
+        prev = next((x for x in reversed(meals[:i]) if x), None)
+        nxt = next((x for x in meals[i + 1 :] if x), None)
+        if prev and nxt and prev != nxt:
+            log(f"끼니 표기 없는 포스트 '{title}' — 앞({prev})/뒤({nxt}) 끼니가 달라 제외")
+            continue
+        resolved[i] = prev or nxt
+        if resolved[i]:
+            log(f"끼니 표기 없는 포스트 '{title}' — 인접 포스트 기준 {resolved[i]}으로 귀속")
+        else:
+            log(f"끼니 표기 없는 포스트 '{title}' — 기준 삼을 인접 포스트가 없어 제외")
+    return list(zip(today, resolved))
+
+
+def match_posts(posts, date_re, keyword):
+    """오늘 날짜 + 해당 끼니로 확정된 포스트만 반환 (고정 포스트 제외).
+
+    날짜는 '7월15일'/'7월15'/'7월 15' 등 표기 흔들림을 흡수하도록 정규식으로 매칭하고,
+    끼니는 제목의 키워드로 판정하되 표기가 빠진 포스트는 resolve_meals가 인접 포스트
+    기준으로 구제한다.
+    """
+    return [p for p, meal in resolve_meals(posts, date_re) if meal == keyword]
 
 
 def category_label(title, date_re, keyword):
@@ -382,6 +422,16 @@ def main():
 
     message, ordered = build_message(matched, date_str, date_re, keyword)
     log(f"포스트 {len(ordered)}개 매칭:\n{message}")
+
+    expected = MEALS[args.meal]["expected_posts"]
+    if len(ordered) < expected:
+        # 조용히 불완전한 메시지가 나가는 걸 막기 위한 경고 (전송 자체는 막지 않는다 —
+        # 일부라도 올라가는 편이 낫고, 빠진 포스트가 있다면 resolve_meals가 제목까지
+        # 이미 로그에 남겼다). 2026-09-04 중식이 이 경우로 샐러드 코너를 빠뜨렸다.
+        log(
+            f"경고: {keyword} 포스트가 기대치({expected}개)보다 적은 {len(ordered)}개 — "
+            "카카오에 아직 안 올라왔거나 제목 표기가 달라 매칭에서 빠졌을 수 있다"
+        )
 
     images, skipped = collect_images(ordered)
     log(f"가로 음식 사진 {len(images)}장 첨부 (영양표 {skipped}장 제외)")
