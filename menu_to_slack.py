@@ -16,7 +16,7 @@ import argparse
 import os
 import re
 import time
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -38,6 +38,9 @@ GRACE_POLL_DELAY = 90  # 본식 발견 후 나머지 포스트를 기다리는 �
 # 회색 placeholder를 내려준다 (2026-07-31 본식 포스트: 2,907B). 정상 음식 사진은
 # 수십~수백 KB이므로 이 미만은 placeholder로 간주해 첨부하지 않는다.
 MIN_IMAGE_BYTES = 10 * 1024
+
+# 제목 속 임의의 날짜 표기 ('10월12일'/'10월 12' 등). 날짜 오기 포스트 판별·라벨 정리용.
+ANY_DATE_RE = re.compile(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일?")
 
 # 재시도·보류가 무의미한 영구(인증/설정) 오류 — 삼키지 않고 즉시 실패로 노출한다.
 FATAL_SLACK_ERRORS = {
@@ -73,6 +76,30 @@ def meal_of(title):
     return None
 
 
+def is_misdated_today(post):
+    """제목 날짜가 과거인데 실제로는 오늘 발행된 포스트면 True (식당 측 날짜 오기).
+
+    2026-10-13 중식 3개 포스트가 오늘 11:01에 발행됐지만 제목이 전부 '10월12일'로
+    올라와 날짜 매칭에서 통째로 빠졌다. 발행일(published_at, KST)이 오늘이면서 제목
+    날짜가 오늘보다 과거인 경우만 오늘 것으로 본다 — 미래 날짜(다음날 메뉴 선게시)는
+    오기로 단정할 수 없으므로 제외한다.
+    """
+    ts = post.get("published_at")
+    m = ANY_DATE_RE.search(post.get("title", ""))
+    if not ts or not m:
+        return False
+    today = datetime.now(KST).date()
+    if datetime.fromtimestamp(ts / 1000, KST).date() != today:
+        return False
+    try:
+        titled = date(today.year, int(m.group(1)), int(m.group(2)))
+    except ValueError:
+        return False
+    if titled > today:  # 연초에 작년 12월 날짜로 오기된 경우
+        titled = titled.replace(year=today.year - 1)
+    return titled < today
+
+
 def resolve_meals(posts, date_re):
     """오늘 포스트를 피드 순서대로 훑어 각 포스트의 끼니를 확정한다.
 
@@ -85,11 +112,15 @@ def resolve_meals(posts, date_re):
 
     반환: [(post, 끼니 키워드 또는 None), ...] (피드 순서 유지)
     """
-    today = [
-        p
-        for p in posts
-        if not p.get("pinned") and date_re.search(p.get("title", ""))
-    ]
+    today = []
+    for p in posts:
+        if p.get("pinned"):
+            continue
+        if date_re.search(p.get("title", "")):
+            today.append(p)
+        elif is_misdated_today(p):
+            log(f"제목 날짜 오기 의심 포스트 '{p.get('title', '').strip()}' — 발행일 기준 오늘로 귀속")
+            today.append(p)
     meals = [meal_of(p.get("title", "")) for p in today]
 
     resolved = list(meals)
@@ -122,7 +153,7 @@ def match_posts(posts, date_re, keyword):
 
 def category_label(title, date_re, keyword):
     """제목에서 날짜/끼니를 제거해 카테고리 라벨을 뽑는다 (없으면 끼니명)."""
-    label = date_re.sub("", title).replace(keyword, "").strip()
+    label = ANY_DATE_RE.sub("", date_re.sub("", title)).replace(keyword, "").strip()
     return label or keyword
 
 
