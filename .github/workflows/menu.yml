@@ -102,4 +102,6 @@ jobs:
         run: python menu_to_slack.py --meal "${{ steps.meal.outputs.meal }}" ${{ steps.meal.outputs.mode }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          # 선택(폴백): 게시 대상은 봇이 초대된 채널 전부를 매 실행 때 조회한다.
+          # 토큰에 channels:read/groups:read가 없는 경우에만 이 채널 하나로 폴백.
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}

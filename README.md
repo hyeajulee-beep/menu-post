@@ -3,6 +3,10 @@
 카카오톡 채널([pf.kakao.com/_BxexgQb](https://pf.kakao.com/_BxexgQb/posts))에 올라오는
 구내식당 중식/석식 메뉴를 슬랙 채널로 자동 전송한다.
 
+**받고 싶은 채널(public/private 모두)에서 `/invite @메뉴봇` 하면 다음 끼니부터 그 채널에도
+올라온다.** 봇이 매 실행 때 자기가 멤버인 채널 목록을 조회해 전부에 게시하므로 별도 설정이
+없다. 그만 받으려면 `/remove @메뉴봇`(채널에서 내보내기) — 역시 다음 끼니부터 반영.
+
 - **중식**: 평일 11:00 KST
 - **석식**: 평일 17:30 KST
 - 두 경로로 이중화: 외부 스케줄러(cron-job.org)가 창 동안 10분 간격으로 호출하는 주
@@ -18,11 +22,13 @@
 1. https://api.slack.com/apps → **Create New App** → **From an app manifest**
 2. 워크스페이스 선택 → `slack-app-manifest.yaml` 내용을 붙여넣기 (스코프가 자동 설정됨)
 3. **Install to Workspace** → `xoxb-`로 시작하는 **Bot User OAuth Token** 복사
-4. 메뉴를 받을 슬랙 채널에서 `/invite @메뉴봇` 으로 봇 초대
-5. 채널 ID 확인: 채널 이름 클릭 → 하단의 `C`로 시작하는 ID 복사
+4. 메뉴를 받을 슬랙 채널(private 포함)에서 `/invite @메뉴봇` 으로 봇 초대 — 이것으로 끝.
+   채널 ID를 따로 적어둘 필요 없이 다음 끼니부터 게시된다
 
-봇 스코프(매니페스트에 포함): `chat:write`, `files:write`, `channels:history`, `groups:history`
-— 뒤 두 개는 **중복 전송 방지**를 위해 채널 기록을 읽는 데 쓴다.
+봇 스코프(매니페스트에 포함): `chat:write`, `files:write`, `channels:history`, `groups:history`,
+`channels:read`, `groups:read`
+— `*:history` 두 개는 **중복 전송 방지**를 위해 채널 기록을 읽는 데, `*:read` 두 개는 **초대된
+채널 자동 탐색**(`users.conversations`)에 쓴다.
 
 > 봇 이름/설명은 `slack-app-manifest.yaml`에서 바꿀 수 있다.
 
@@ -31,16 +37,20 @@
 봇에 새 권한(scope)을 추가하면 반드시 재설치해야 새 토큰에 반영된다.
 
 1. https://api.slack.com/apps → 해당 앱 → **OAuth & Permissions** → Bot Token Scopes에
-   `channels:history`, `groups:history` 추가
+   추가 (예: 초대된 채널 자동 탐색을 위해 `channels:read`, `groups:read`)
 2. 상단 배너의 **Reinstall to Workspace** → 새 `xoxb-` 토큰 복사
 3. GitHub Secret 갱신: `gh secret set SLACK_BOT_TOKEN --repo <owner>/menu-post --body '<새 토큰>'`
+
+> `channels:read`/`groups:read`가 없는 구 토큰으로 돌면 스크립트가 `missing_scope`를 로그하고
+> `SLACK_CHANNEL_ID` 시크릿의 채널 하나로 폴백한다. 재설치 전까지 기존 채널 게시는 끊기지 않는다.
 
 ### 2. GitHub 설정
 
 1. 이 디렉토리를 private repo로 push
 2. repo **Settings → Secrets and variables → Actions** 에 등록:
    - `SLACK_BOT_TOKEN`: 위에서 복사한 `xoxb-` 토큰
-   - `SLACK_CHANNEL_ID`: 채널 ID
+   - `SLACK_CHANNEL_ID` (선택, 폴백용): 토큰에 `channels:read`/`groups:read`가 없을 때만 쓰는
+     단일 채널 ID. 정상 상태에서는 초대된 채널을 자동 탐색하므로 필요 없다
 3. **Actions** 탭 → `menu-to-slack` → **Run workflow** 로 수동 실행해 동작 확인
 
 ### 3. 정시 실행용 외부 스케줄러 (cron-job.org)
@@ -98,9 +108,11 @@ python menu_to_slack.py --meal lunch --no-wait --max-wait 1 --dry-run
 # --allow-partial 없이는 부분 전송을 하지 않고 종료해 다음 발동이 재시도한다.
 python menu_to_slack.py --meal lunch --no-wait --max-wait 1 --allow-partial --dry-run
 
-# 실제 전송 (1회 조회 후 종료 — 수동 실행 방식)
+# 봇이 초대된(게시 대상) 채널 목록 확인
 export SLACK_BOT_TOKEN=xoxb-...
-export SLACK_CHANNEL_ID=C...
+python menu_to_slack.py --list-channels
+
+# 실제 전송 (1회 조회 후 종료 — 수동 실행 방식). 초대된 모든 채널에 게시된다
 python menu_to_slack.py --meal lunch --once
 ```
 
@@ -139,9 +151,13 @@ python menu_to_slack.py --meal lunch --once
 - 본식 포스트 발견 시 나머지 카테고리 포스트(샐러드인더키친, T/O도시락&베이커리)가 덜
   올라왔으면 90초 더 기다렸다가 한 메시지로 합쳐 전송. 본식이 아직 없으면 즉시 종료하고
   다음 스케줄 발동이 재시도한다
-- **중복 방지(멱등성)**: 전송 직전 채널 최근 메시지를 조회해, 오늘 같은 끼니(`N월N일 끼니`로
-  시작하는 봇 메시지)가 이미 있으면 전송을 생략 — 스케줄러가 10분 간격으로 여러 번 발동하거나
-  수동+자동이 겹쳐도 같은 끼니를 두 번 올리지 않는다
+- **게시 대상 채널 자동 탐색**: 전송 때마다 `users.conversations`로 봇이 멤버인 public/private
+  채널을 전부 조회해 각각에 게시한다. `/invite`·`/remove`가 다음 끼니부터 반영되는 이유.
+  한 채널에서만 나는 오류(추방됨·보관됨 등)는 그 채널만 건너뛰고 나머지는 계속 게시하되,
+  run은 실패로 표시해 Actions 로그에서 보이게 한다
+- **중복 방지(멱등성)**: 채널마다 전송 직전 최근 메시지를 조회해, 오늘 같은 끼니(`N월N일 끼니`로
+  시작하는 봇 메시지)가 이미 있으면 그 채널은 생략 — 스케줄러가 10분 간격으로 여러 번 발동하거나
+  수동+자동이 겹쳐도 같은 끼니를 두 번 올리지 않고, 일부 채널만 실패한 run의 재실행도 안전하다
 - 이미지 첨부 실패 시 텍스트만이라도 전송
 
 ## 알려진 제약

@@ -8,8 +8,13 @@
     python menu_to_slack.py --meal dinner
     python menu_to_slack.py --meal lunch --dry-run         # 슬랙 전송 없이 메시지만 출력
     python menu_to_slack.py --meal lunch --once --resend   # 기존 메시지 삭제 후 재전송
+    python menu_to_slack.py --list-channels                # 봇이 초대된 채널 목록만 출력
 
-필요 환경변수: SLACK_BOT_TOKEN, SLACK_CHANNEL_ID (dry-run 시 불필요)
+게시 대상: 봇이 멤버인 모든 public/private 채널(/invite @메뉴봇 한 채널 전부). 매 실행 때
+Slack에서 목록을 조회하므로 초대·추방은 다음 끼니부터 반영된다.
+
+필요 환경변수: SLACK_BOT_TOKEN (dry-run 시 불필요).
+SLACK_CHANNEL_ID는 선택 — channels:read/groups:read 스코프가 없는 구 토큰일 때만 폴백으로 쓴다.
 """
 
 import argparse
@@ -54,6 +59,10 @@ FATAL_SLACK_ERRORS = {
     "is_archived",
     "missing_scope",
 }
+
+# 특정 채널에만 해당하는 오류 — 그 채널만 건너뛰고 나머지 채널 게시는 계속한다.
+# (채널 목록 조회 뒤 추방·보관된 경우 등) 토큰 오류와 달리 run 전체를 중단할 이유가 없다.
+CHANNEL_SCOPED_ERRORS = {"channel_not_found", "not_in_channel", "is_archived"}
 
 
 def log(msg):
@@ -282,24 +291,65 @@ def delete_existing(client, channel, header_line):
         log(f"'{header_line}' 기존 메시지 없음 — 삭제 생략")
 
 
-def send_to_slack(message, images, resend=False):
-    from slack_sdk import WebClient
+def list_member_channels(client):
+    """봇이 멤버인 public/private 채널 [(id, name), ...]을 반환한다.
 
-    token = os.environ["SLACK_BOT_TOKEN"]
-    channel = os.environ["SLACK_CHANNEL_ID"]
-    client = WebClient(token=token)
+    /invite된 채널을 매 실행 때 탐색해 전부에 게시하기 위한 것. channels:read·groups:read
+    스코프가 필요하며, 스코프가 없는 구 토큰(앱 재설치 전)이면 None을 반환해 호출부가
+    SLACK_CHANNEL_ID 폴백을 쓰게 한다 — 코드 배포와 토큰 갱신 순서가 어긋나도 기존 채널
+    게시가 끊기지 않게. DM(im/mpim)은 조회하지 않는다.
+    """
+    from slack_sdk.errors import SlackApiError
 
-    # 토큰 유효성을 먼저 확인해 무효 토큰이면 여기서 바로(명확히) 실패시킨다.
-    # 이렇게 안 하면 인증 오류가 "이미 전송됨"으로 위장돼 run이 조용히 success로 뜬다.
-    auth = client.auth_test()
-    log(f"봇 {auth.get('user')} 인증 확인 (team: {auth.get('team')})")
+    channels = []
+    cursor = None
+    while True:
+        try:
+            resp = client.users_conversations(
+                types="public_channel,private_channel",
+                exclude_archived=True,
+                limit=200,
+                cursor=cursor,
+            )
+        except SlackApiError as e:
+            if e.response.get("error") == "missing_scope":
+                log(
+                    "채널 목록 조회 불가(missing_scope) — 토큰에 channels:read/groups:read가 "
+                    "없음. 앱 재설치 후 SLACK_BOT_TOKEN 갱신 필요. SLACK_CHANNEL_ID로 폴백"
+                )
+                return None
+            raise
+        channels.extend(
+            (c["id"], c.get("name", c["id"])) for c in resp.get("channels", [])
+        )
+        cursor = (resp.get("response_metadata") or {}).get("next_cursor") or None
+        if not cursor:
+            return channels
 
+
+def resolve_channels(client):
+    """게시 대상 채널 목록을 정한다. 하나도 없으면 raise — run이 조용히 success로 뜨지 않게."""
+    channels = list_member_channels(client)
+    if channels is None:
+        fallback = os.environ.get("SLACK_CHANNEL_ID")
+        if not fallback:
+            raise RuntimeError(
+                "채널 목록 조회 스코프가 없고 SLACK_CHANNEL_ID도 없음 — "
+                "앱 재설치 후 토큰을 갱신하거나 SLACK_CHANNEL_ID를 설정할 것"
+            )
+        return [(fallback, fallback)]
+    if not channels:
+        raise RuntimeError("봇이 초대된 채널이 없음 — 받을 채널에서 /invite @메뉴봇 후 재실행")
+    return channels
+
+
+def post_to_channel(client, channel, label, message, images, resend):
     header_line = message.splitlines()[0]
     if resend:
         # 삭제 직후 채널 기록 조회는 레이스가 있으므로 already_sent 체크는 건너뛴다.
         delete_existing(client, channel, header_line)
     elif already_sent(client, channel, header_line):
-        log(f"'{header_line}' 이미 전송됨 — 중복 방지로 생략")
+        log(f"{label}: '{header_line}' 이미 전송됨 — 중복 방지로 생략")
         return
 
     if images:
@@ -312,13 +362,49 @@ def send_to_slack(message, images, resend=False):
                     for name, data in images
                 ],
             )
-            log(f"슬랙 전송 완료 (이미지 {len(images)}장 첨부)")
+            log(f"{label}: 슬랙 전송 완료 (이미지 {len(images)}장 첨부)")
             return
         except Exception as e:
-            log(f"이미지 첨부 전송 실패, 텍스트만 전송으로 폴백: {e}")
+            log(f"{label}: 이미지 첨부 전송 실패, 텍스트만 전송으로 폴백: {e}")
 
     client.chat_postMessage(channel=channel, text=message)
-    log("슬랙 전송 완료 (텍스트만)")
+    log(f"{label}: 슬랙 전송 완료 (텍스트만)")
+
+
+def send_to_slack(message, images, resend=False):
+    """봇이 초대된 모든 채널에 게시한다. 채널별로 중복 확인·전송을 독립 수행한다.
+
+    한 채널의 채널 한정 오류(CHANNEL_SCOPED_ERRORS)는 그 채널만 건너뛰고 계속 진행하되,
+    끝에 RuntimeError로 run을 실패 표시해 Actions에서 보이게 한다. 이미 게시된 채널은
+    백스톱 재실행 때 already_sent로 skip되므로 멱등성은 유지된다.
+    """
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+
+    client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+
+    # 토큰 유효성을 먼저 확인해 무효 토큰이면 여기서 바로(명확히) 실패시킨다.
+    # 이렇게 안 하면 인증 오류가 "이미 전송됨"으로 위장돼 run이 조용히 success로 뜬다.
+    auth = client.auth_test()
+    log(f"봇 {auth.get('user')} 인증 확인 (team: {auth.get('team')})")
+
+    channels = resolve_channels(client)
+    log("게시 대상 채널 " + ", ".join(f"#{name}({cid})" for cid, name in channels))
+
+    failed = []
+    for channel, name in channels:
+        label = f"#{name}"
+        try:
+            post_to_channel(client, channel, label, message, images, resend)
+        except SlackApiError as e:
+            err = e.response.get("error")
+            if err not in CHANNEL_SCOPED_ERRORS:
+                raise
+            log(f"{label}: 채널 오류({err}) — 이 채널만 건너뜀")
+            failed.append(f"{label}({err})")
+
+    if failed:
+        raise RuntimeError(f"일부 채널 전송 실패: {', '.join(failed)}")
 
 
 def wait_until_send_time(meal):
@@ -405,7 +491,12 @@ def poll_until_found(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--meal", choices=MEALS, required=True)
+    parser.add_argument("--meal", choices=MEALS)
+    parser.add_argument(
+        "--list-channels",
+        action="store_true",
+        help="봇이 초대된(게시 대상) 채널 목록만 출력하고 종료. SLACK_BOT_TOKEN 필요",
+    )
     parser.add_argument(
         "--once",
         action="store_true",
@@ -431,6 +522,18 @@ def main():
     )
     parser.add_argument("--dry-run", action="store_true", help="슬랙 전송 없이 출력만")
     args = parser.parse_args()
+
+    if args.list_channels:
+        from slack_sdk import WebClient
+
+        client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+        auth = client.auth_test()
+        log(f"봇 {auth.get('user')} 인증 확인 (team: {auth.get('team')})")
+        for cid, name in resolve_channels(client):
+            print(f"{cid}\t#{name}")
+        return
+    if not args.meal:
+        parser.error("--meal 또는 --list-channels 중 하나가 필요")
 
     keyword = MEALS[args.meal]["keyword"]
     now = datetime.now(KST)

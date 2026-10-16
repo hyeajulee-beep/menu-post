@@ -12,6 +12,8 @@ oauth_config:
       - files:write
       - channels:history
       - groups:history
+      - channels:read
+      - groups:read
 settings:
   org_deploy_enabled: false
   socket_mode_enabled: false
