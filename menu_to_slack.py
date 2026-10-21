@@ -242,13 +242,42 @@ def collect_images(posts):
     return images, skipped
 
 
+def day_start_ts():
+    """대상 날짜 0시(KST)의 unix ts. 중복 확인·삭제가 훑을 채널 기록의 시작점."""
+    day = target_date()
+    return datetime(day.year, day.month, day.day, tzinfo=KST).timestamp()
+
+
+def find_bot_messages(client, channel, header_line, oldest):
+    """oldest 이후 채널 기록 전체에서 header_line으로 시작하는 봇 메시지를 찾는다.
+
+    예전엔 최근 15개만 봤는데, 대화가 많은 채널에선 몇 시간 전 포스트가 그 밖으로
+    밀려나 중복 전송됐다(2026-10-21 23:09, 10/20 석식). 그래서 개수가 아니라 시각으로
+    범위를 잡고 페이지를 끝까지 넘긴다. 한 페이지는 응답 크기(첨부 메타로 커짐)를
+    줄여 IncompleteRead를 완화하려고 작게 유지한다.
+    """
+    found = []
+    cursor = None
+    while True:
+        resp = client.conversations_history(
+            channel=channel, oldest=str(oldest), limit=50, cursor=cursor
+        )
+        found.extend(
+            m
+            for m in resp.get("messages", [])
+            if m.get("bot_id") and m.get("text", "").startswith(header_line)
+        )
+        cursor = (resp.get("response_metadata") or {}).get("next_cursor") or None
+        if not cursor:
+            return found
+
+
 def already_sent(client, channel, header_line):
     """채널에 오늘 같은 끼니(header_line으로 시작하는 봇 메시지)가 이미 있으면 True.
 
     중복 전송 방지용. 네트워크 오류(IncompleteRead 등)에 대비해 여러 번 재시도하고,
     끝까지 조회에 실패하면 안전하게 True를 반환해 전송을 보류한다 — 중복보다 누락이
-    낫고, 누락은 다음 백업 크론 실행이 재시도로 메운다. limit은 응답 크기(첨부 메타로
-    커짐)를 줄여 IncompleteRead를 완화하려고 작게 잡는다.
+    낫고, 누락은 다음 백업 크론 실행이 재시도로 메운다. 범위는 대상 날짜 0시 이후 전체.
 
     단, 인증/설정 오류(FATAL_SLACK_ERRORS)는 재시도·보류가 무의미하므로 삼키지 않고
     그대로 raise한다 — 조용히 "이미 전송됨"으로 위장돼 run이 success로 뜨는 걸 막는다.
@@ -258,11 +287,7 @@ def already_sent(client, channel, header_line):
     last_err = None
     for attempt in range(4):
         try:
-            resp = client.conversations_history(channel=channel, limit=15)
-            for msg in resp.get("messages", []):
-                if msg.get("bot_id") and msg.get("text", "").startswith(header_line):
-                    return True
-            return False
+            return bool(find_bot_messages(client, channel, header_line, day_start_ts()))
         except SlackApiError as e:
             if e.response.get("error") in FATAL_SLACK_ERRORS:
                 raise
@@ -284,19 +309,15 @@ def delete_existing(client, channel, header_line, oldest=None):
     허용하므로 추가 스코프가 필요 없다. 메시지 삭제가 실패하면 raise한다 —
     조용히 넘어가면 already_sent가 재전송을 차단해 run만 success로 위장된다.
 
-    oldest(unix ts)를 주면 그 이후 메시지만 대상으로 한다 — 잘못 다시 나간 중복만
-    지우고 원래 포스트는 남길 때.
+    기본 범위는 대상 날짜 0시 이후. oldest(unix ts)를 주면 그 이후 메시지만 대상으로
+    한다 — 잘못 다시 나간 중복만 지우고 원래 포스트는 남길 때.
     """
     from slack_sdk.errors import SlackApiError
 
     deleted = 0
     if oldest is None:
-        resp = client.conversations_history(channel=channel, limit=15)
-    else:
-        resp = client.conversations_history(channel=channel, oldest=str(oldest), limit=200)
-    for msg in resp.get("messages", []):
-        if not (msg.get("bot_id") and msg.get("text", "").startswith(header_line)):
-            continue
+        oldest = day_start_ts()
+    for msg in find_bot_messages(client, channel, header_line, oldest):
         client.chat_delete(channel=channel, ts=msg["ts"])
         deleted += 1
         log(f"기존 메시지 삭제: ts={msg['ts']}")
