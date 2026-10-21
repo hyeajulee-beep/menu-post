@@ -114,6 +114,9 @@ python menu_to_slack.py --list-channels
 
 # 실제 전송 (1회 조회 후 종료 — 수동 실행 방식). 초대된 모든 채널에 게시된다
 python menu_to_slack.py --meal lunch --once
+
+# 누락된 지난 끼니를 늦게 전송 (Actions 수동 실행의 date 입력과 같다)
+python menu_to_slack.py --meal dinner --once --date 2026-10-21
 ```
 
 ## 동작 방식

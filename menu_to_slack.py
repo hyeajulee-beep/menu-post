@@ -8,6 +8,7 @@
     python menu_to_slack.py --meal dinner
     python menu_to_slack.py --meal lunch --dry-run         # 슬랙 전송 없이 메시지만 출력
     python menu_to_slack.py --meal lunch --once --resend   # 기존 메시지 삭제 후 재전송
+    python menu_to_slack.py --meal dinner --once --date 2026-10-21  # 지난 날짜 끼니를 늦게 전송
     python menu_to_slack.py --list-channels                # 봇이 초대된 채널 목록만 출력
 
 게시 대상: 봇이 멤버인 모든 public/private 채널(/invite @메뉴봇 한 채널 전부). 매 실행 때
@@ -46,6 +47,15 @@ MIN_IMAGE_BYTES = 10 * 1024
 
 # 제목 속 임의의 날짜 표기 ('10월12일'/'10월 12' 등). 날짜 오기 포스트 판별·라벨 정리용.
 ANY_DATE_RE = re.compile(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일?")
+
+# --date로 지정한 대상 날짜. None이면 실행 시점의 오늘(KST).
+TARGET_DATE = None
+
+
+def target_date():
+    """메뉴를 찾을 날짜. 평소엔 오늘이고, 누락된 끼니를 다음날 늦게 보낼 때만 --date로 바꾼다."""
+    return TARGET_DATE or datetime.now(KST).date()
+
 
 # 재시도·보류가 무의미한 영구(인증/설정) 오류 — 삼키지 않고 즉시 실패로 노출한다.
 FATAL_SLACK_ERRORS = {
@@ -97,7 +107,7 @@ def is_misdated_today(post):
     m = ANY_DATE_RE.search(post.get("title", ""))
     if not ts or not m:
         return False
-    today = datetime.now(KST).date()
+    today = target_date()
     if datetime.fromtimestamp(ts / 1000, KST).date() != today:
         return False
     try:
@@ -523,6 +533,13 @@ def main():
         help="전송 전에 오늘 같은 끼니의 기존 봇 메시지를 삭제하고 다시 전송(--once와 함께 사용)",
     )
     parser.add_argument("--dry-run", action="store_true", help="슬랙 전송 없이 출력만")
+    parser.add_argument(
+        "--date",
+        type=date.fromisoformat,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="오늘 대신 이 날짜의 끼니를 찾는다(누락분 지연 전송용, --once와 함께 사용)",
+    )
     args = parser.parse_args()
 
     if args.list_channels:
@@ -537,10 +554,12 @@ def main():
     if not args.meal:
         parser.error("--meal 또는 --list-channels 중 하나가 필요")
 
+    global TARGET_DATE
+    TARGET_DATE = args.date
     keyword = MEALS[args.meal]["keyword"]
-    now = datetime.now(KST)
-    date_str = f"{now.month}월{now.day}일"
-    date_re = re.compile(rf"{now.month}\s*월\s*{now.day}\s*일?")
+    day = target_date()
+    date_str = f"{day.month}월{day.day}일"
+    date_re = re.compile(rf"{day.month}\s*월\s*{day.day}\s*일?")
     log(f"대상: {date_str} {keyword}")
 
     if args.once:
