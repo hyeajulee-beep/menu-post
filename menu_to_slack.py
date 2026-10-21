@@ -385,15 +385,17 @@ def send_to_slack(message, images, resend=False):
 
     # 토큰 유효성을 먼저 확인해 무효 토큰이면 여기서 바로(명확히) 실패시킨다.
     # 이렇게 안 하면 인증 오류가 "이미 전송됨"으로 위장돼 run이 조용히 success로 뜬다.
-    auth = client.auth_test()
-    log(f"봇 {auth.get('user')} 인증 확인 (team: {auth.get('team')})")
+    client.auth_test()
+    log("봇 인증 확인")
 
+    # 공개 저장소라 Actions 로그가 누구에게나 보인다 — 워크스페이스·채널 이름/ID(private
+    # 채널 포함)를 찍지 않고 순번만 남긴다. 순번↔채널 대응은 로컬에서 --list-channels로 확인.
     channels = resolve_channels(client)
-    log("게시 대상 채널 " + ", ".join(f"#{name}({cid})" for cid, name in channels))
+    log(f"게시 대상 채널 {len(channels)}개")
 
     failed = []
-    for channel, name in channels:
-        label = f"#{name}"
+    for i, (channel, _name) in enumerate(channels, 1):
+        label = f"채널 {i}/{len(channels)}"
         try:
             post_to_channel(client, channel, label, message, images, resend)
         except SlackApiError as e:
@@ -529,8 +531,8 @@ def main():
         client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
         auth = client.auth_test()
         log(f"봇 {auth.get('user')} 인증 확인 (team: {auth.get('team')})")
-        for cid, name in resolve_channels(client):
-            print(f"{cid}\t#{name}")
+        for i, (cid, name) in enumerate(resolve_channels(client), 1):
+            print(f"{i}\t{cid}\t#{name}")
         return
     if not args.meal:
         parser.error("--meal 또는 --list-channels 중 하나가 필요")
