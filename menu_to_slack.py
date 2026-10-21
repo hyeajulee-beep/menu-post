@@ -9,6 +9,8 @@
     python menu_to_slack.py --meal lunch --dry-run         # 슬랙 전송 없이 메시지만 출력
     python menu_to_slack.py --meal lunch --once --resend   # 기존 메시지 삭제 후 재전송
     python menu_to_slack.py --meal dinner --once --date 2026-10-21  # 지난 날짜 끼니를 늦게 전송
+    python menu_to_slack.py --meal dinner --date 2026-10-20 --delete-sent-after 2026-10-21T23:00
+                                                           # 그 시각 이후 잘못 나간 메시지만 삭제
     python menu_to_slack.py --list-channels                # 봇이 초대된 채널 목록만 출력
 
 게시 대상: 봇이 멤버인 모든 public/private 채널(/invite @메뉴봇 한 채널 전부). 매 실행 때
@@ -275,17 +277,23 @@ def already_sent(client, channel, header_line):
     return True
 
 
-def delete_existing(client, channel, header_line):
+def delete_existing(client, channel, header_line, oldest=None):
     """header_line으로 시작하는 기존 봇 메시지와 그 첨부 파일을 삭제한다.
 
     chat:write는 봇 자신의 메시지 삭제를, files:write는 봇이 올린 파일 삭제를
     허용하므로 추가 스코프가 필요 없다. 메시지 삭제가 실패하면 raise한다 —
     조용히 넘어가면 already_sent가 재전송을 차단해 run만 success로 위장된다.
+
+    oldest(unix ts)를 주면 그 이후 메시지만 대상으로 한다 — 잘못 다시 나간 중복만
+    지우고 원래 포스트는 남길 때.
     """
     from slack_sdk.errors import SlackApiError
 
     deleted = 0
-    resp = client.conversations_history(channel=channel, limit=15)
+    if oldest is None:
+        resp = client.conversations_history(channel=channel, limit=15)
+    else:
+        resp = client.conversations_history(channel=channel, oldest=str(oldest), limit=200)
     for msg in resp.get("messages", []):
         if not (msg.get("bot_id") and msg.get("text", "").startswith(header_line)):
             continue
@@ -379,6 +387,19 @@ def post_to_channel(client, channel, label, message, images, resend):
 
     client.chat_postMessage(channel=channel, text=message)
     log(f"{label}: 슬랙 전송 완료 (텍스트만)")
+
+
+def delete_sent_after(header_line, cutoff):
+    """봇이 초대된 모든 채널에서 cutoff 이후 보낸 header_line 메시지만 삭제한다."""
+    from slack_sdk import WebClient
+
+    client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+    client.auth_test()
+    log(f"'{header_line}' 중 {cutoff.strftime('%m-%d %H:%M')} KST 이후 전송분 삭제")
+    channels = resolve_channels(client)
+    for i, (channel, _name) in enumerate(channels, 1):
+        log(f"채널 {i}/{len(channels)}")
+        delete_existing(client, channel, header_line, oldest=cutoff.timestamp())
 
 
 def send_to_slack(message, images, resend=False):
@@ -540,6 +561,13 @@ def main():
         metavar="YYYY-MM-DD",
         help="오늘 대신 이 날짜의 끼니를 찾는다(누락분 지연 전송용, --once와 함께 사용)",
     )
+    parser.add_argument(
+        "--delete-sent-after",
+        type=lambda v: datetime.fromisoformat(v).replace(tzinfo=KST),
+        default=None,
+        metavar="YYYY-MM-DDTHH:MM",
+        help="전송 대신, 이 시각(KST) 이후 보낸 해당 끼니 봇 메시지만 모든 채널에서 삭제",
+    )
     args = parser.parse_args()
 
     if args.list_channels:
@@ -561,6 +589,11 @@ def main():
     date_str = f"{day.month}월{day.day}일"
     date_re = re.compile(rf"{day.month}\s*월\s*{day.day}\s*일?")
     log(f"대상: {date_str} {keyword}")
+
+    if args.delete_sent_after:
+        if not args.dry_run:
+            delete_sent_after(f"{date_str} {keyword}", args.delete_sent_after)
+        return
 
     if args.once:
         matched = find_once(date_re, keyword, args.meal, date_str)
